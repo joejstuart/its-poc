@@ -1,0 +1,241 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: integration-test
+  labels:
+    app.kubernetes.io/version: "0.3"
+  annotations:
+    tekton.dev/categories: Testing
+    tekton.dev/displayName: integration test
+    tekton.dev/platforms: linux/amd64
+spec:
+  description: |
+    Integration test task that validates an image and produces test results.
+
+    This task follows the attestation pattern from ADR-48:
+    1. Runs the test and determines pass/fail
+    2. Creates an in-toto test-result predicate
+    3. Signs and pushes the attestation using cosign
+    4. Outputs the attestation reference via *_ARTIFACT_OUTPUTS result
+
+    Other tasks can follow this same pattern for vulnerability scans,
+    compliance checks, etc.
+
+  params:
+    - name: IMAGE_URL
+      type: string
+      description: The image URL that was built
+    - name: IMAGE_DIGEST
+      type: string
+      description: The image digest (sha256:...)
+    - name: TEST_NAME
+      type: string
+      description: Name of the test being run
+      default: "integration-test"
+
+  results:
+    - name: TEST_OUTPUT
+      description: JSON summary of the test results
+      type: string
+    - name: PASSED
+      description: Whether the test passed (true/false)
+      type: string
+    - name: TEST_OUTPUT_ARTIFACT_OUTPUTS
+      description: |
+        Reference to the test-result attestation pushed to registry.
+        Tekton Chains will include this in the SLSA provenance attestation.
+        Format: {"uri": "<image-url>", "digest": "<sha256:...>"}
+      type: object
+      properties:
+        uri: {}
+        digest: {}
+
+  workspaces:
+    - name: cosign-keys
+      description: |
+        Workspace containing cosign.key and cosign.pub for signing.
+        The attestation will be signed with this key.
+    - name: dockerconfig
+      description: |
+        Docker config for registry authentication.
+        Must be a directory containing config.json (mount a secret with that key).
+
+  steps:
+    # Step 1: Run the actual test
+    - name: run-test
+      image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+      env:
+        - name: IMAGE_URL
+          value: $(params.IMAGE_URL)
+        - name: IMAGE_DIGEST
+          value: $(params.IMAGE_DIGEST)
+        - name: TEST_NAME
+          value: $(params.TEST_NAME)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        echo "=== Running Integration Test ==="
+        echo "Test:   ${TEST_NAME}"
+        echo "Image:  ${IMAGE_URL}@${IMAGE_DIGEST}"
+        echo ""
+
+        # ============================================================
+        # TODO: Replace this with actual test logic
+        # ============================================================
+        echo "Executing test steps..."
+        sleep 2
+
+        # Determine test result
+        # In a real task, this would be based on actual test execution
+        RESULT="PASSED"
+        PASSED="true"
+        # ============================================================
+
+        echo "Test ${TEST_NAME} completed: ${RESULT}"
+
+        # Save result for next step
+        mkdir -p /tekton/home/attestation
+        echo -n "${RESULT}" > /tekton/home/attestation/result
+        echo -n "${PASSED}" > "$(results.PASSED.path)"
+
+    # Step 2: Create predicate and attest
+    # This step follows the reusable attestation pattern
+    - name: create-attestation
+      image: alpine:3.19
+      env:
+        - name: IMAGE_URL
+          value: $(params.IMAGE_URL)
+        - name: IMAGE_DIGEST
+          value: $(params.IMAGE_DIGEST)
+        - name: TEST_NAME
+          value: $(params.TEST_NAME)
+        - name: COSIGN_PASSWORD
+          value: ""
+        # Workspace paths
+        - name: COSIGN_KEY
+          value: $(workspaces.cosign-keys.path)/cosign.key
+        - name: DOCKER_CONFIG
+          value: $(workspaces.dockerconfig.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # ============================================================
+        # ATTESTATION PATTERN - Reuse this for other attestation tasks
+        # ============================================================
+
+        echo "Installing dependencies..."
+        apk add --no-cache jq > /dev/null 2>&1
+
+        echo "Installing cosign and oras..."
+        # Download cosign v2.5.0+ for --new-bundle-format support
+        COSIGN_VERSION="v2.5.0"
+        ORAS_VERSION="v1.2.0"
+        ARCH=$(uname -m)
+        case "${ARCH}" in
+          x86_64) ARCH="amd64" ;;
+          aarch64) ARCH="arm64" ;;
+        esac
+        wget -q "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${ARCH}" -O /usr/local/bin/cosign
+        chmod +x /usr/local/bin/cosign
+
+        # Download oras to query referrers for attestation digest
+        wget -q "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_${ORAS_VERSION#v}_linux_${ARCH}.tar.gz" -O /tmp/oras.tar.gz
+        tar -xzf /tmp/oras.tar.gz -C /usr/local/bin oras
+        chmod +x /usr/local/bin/oras
+
+        RESULT=$(cat /tekton/home/attestation/result)
+        TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        IMAGE_REF="${IMAGE_URL}@${IMAGE_DIGEST}"
+        PREDICATE_TYPE="https://in-toto.io/attestation/test-result/v0.1"
+        PREDICATE_FILE="/tekton/home/attestation/predicate.json"
+
+        echo "=== Creating Attestation ==="
+        echo "Image:          ${IMAGE_REF}"
+        echo "Predicate Type: ${PREDICATE_TYPE}"
+        echo "Result:         ${RESULT}"
+        echo ""
+
+        # --- Create the in-toto predicate ---
+        # Spec: https://github.com/in-toto/attestation/blob/main/spec/predicates/test-result.md
+        cat > "${PREDICATE_FILE}" <<EOF
+        {
+          "result": "${RESULT}",
+          "timestamp": "${TIMESTAMP}",
+          "configuration": [
+            {
+              "name": "${TEST_NAME}",
+              "annotations": {
+                "tekton.dev/task": "integration-test"
+              }
+            }
+          ],
+          "passedTests": ["${TEST_NAME}"],
+          "warnedTests": [],
+          "failedTests": []
+        }
+        EOF
+
+        echo "Predicate:"
+        cat "${PREDICATE_FILE}"
+        echo ""
+
+        # --- Create test output summary for task result ---
+        cat > /tekton/home/attestation/output.json <<EOF
+        {"result":"${RESULT}","timestamp":"${TIMESTAMP}","test":{"name":"${TEST_NAME}","type":"integration"},"subject":{"uri":"${IMAGE_URL}","digest":"${IMAGE_DIGEST}"}}
+        EOF
+        cat /tekton/home/attestation/output.json > "$(results.TEST_OUTPUT.path)"
+
+        # --- Sign and push attestation ---
+        echo "=== Signing and Pushing Attestation ==="
+
+        # Verify prerequisites
+        if [ ! -f "${COSIGN_KEY}" ]; then
+          echo "ERROR: Cosign key not found at ${COSIGN_KEY}"
+          echo -n "" > "$(results.TEST_OUTPUT_ARTIFACT_OUTPUTS.path)"
+          exit 1
+        fi
+
+        if [ ! -f "${DOCKER_CONFIG}/config.json" ]; then
+          echo "ERROR: Docker config not found at ${DOCKER_CONFIG}/config.json"
+          echo -n "" > "$(results.TEST_OUTPUT_ARTIFACT_OUTPUTS.path)"
+          exit 1
+        fi
+
+        echo "Using cosign key: ${COSIGN_KEY}"
+        echo "Using docker config: ${DOCKER_CONFIG}"
+
+        # Push attestation to registry in sigstore bundle format
+        cosign attest \
+          --key "${COSIGN_KEY}" \
+          --type "${PREDICATE_TYPE}" \
+          --predicate "${PREDICATE_FILE}" \
+          --tlog-upload=false \
+          --new-bundle-format \
+          "${IMAGE_REF}"
+
+        echo ""
+        echo "=== Attestation Pushed ==="
+
+        # Query the registry to get the attestation digest
+        # The attestation is stored as an OCI referrer with sigstore bundle media type
+        echo "Querying registry for attestation digest..."
+        ATTESTATION_DIGEST=$(oras discover -o json "${IMAGE_REF}" | \
+          jq -r '.manifests[] | select(.artifactType == "application/vnd.dev.sigstore.bundle.v0.3+json") | select(.annotations["dev.sigstore.bundle.predicateType"] == "'"${PREDICATE_TYPE}"'") | .digest' | \
+          head -1)
+
+        if [ -z "${ATTESTATION_DIGEST}" ]; then
+          echo "WARNING: Could not find attestation digest, falling back to image digest"
+          ATTESTATION_DIGEST="${IMAGE_DIGEST}"
+        fi
+
+        echo "Attestation digest: ${ATTESTATION_DIGEST}"
+
+        # Output the artifact reference for ARTIFACT_OUTPUTS
+        # This references the attestation itself, not the image
+        # Chains will generate SLSA provenance about this attestation
+        printf '{"uri":"%s","digest":"%s"}' "${IMAGE_URL}" "${ATTESTATION_DIGEST}" > "$(results.TEST_OUTPUT_ARTIFACT_OUTPUTS.path)"
+
+        echo "Attestation attached to: ${IMAGE_REF}"
+        echo "ARTIFACT_OUTPUTS: {\"uri\":\"${IMAGE_URL}\",\"digest\":\"${ATTESTATION_DIGEST}\"}"

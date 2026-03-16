@@ -1,0 +1,51 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: integration-test-pipeline
+spec:
+  description: |
+    Integration test pipeline that runs after a build completes.
+    This pipeline takes the built image reference and runs integration
+    tests against it. The test task generates an in-toto test-result
+    attestation and pushes it to the registry. Tekton Chains will
+    generate SLSA provenance that references these task-generated
+    attestations via the ARTIFACT_OUTPUTS results.
+  params:
+    - name: IMAGE_URL
+      type: string
+      description: The image URL from the build pipeline
+    - name: IMAGE_DIGEST
+      type: string
+      description: The image digest from the build pipeline
+  workspaces:
+    - name: cosign-keys
+      description: Workspace containing cosign.key and cosign.pub for signing attestations
+    - name: dockerconfig
+      description: Docker config for registry authentication (directory with config.json)
+  results:
+    - name: TEST_OUTPUT
+      description: The test output JSON
+      value: $(tasks.run-integration-test.results.TEST_OUTPUT)
+    - name: PASSED
+      description: Whether all tests passed
+      value: $(tasks.run-integration-test.results.PASSED)
+    - name: TEST_OUTPUT_ARTIFACT_OUTPUTS
+      description: Reference to the test attestation in the registry
+      type: object
+      value: $(tasks.run-integration-test.results.TEST_OUTPUT_ARTIFACT_OUTPUTS[*])
+  tasks:
+    - name: run-integration-test
+      taskRef:
+        name: integration-test
+      params:
+        - name: IMAGE_URL
+          value: $(params.IMAGE_URL)
+        - name: IMAGE_DIGEST
+          value: $(params.IMAGE_DIGEST)
+        - name: TEST_NAME
+          value: "image-validation"
+      workspaces:
+        - name: cosign-keys
+          workspace: cosign-keys
+        - name: dockerconfig
+          workspace: dockerconfig
